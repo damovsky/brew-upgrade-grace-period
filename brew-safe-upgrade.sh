@@ -37,7 +37,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 # ── helpers ─────────────────────────────────────────────────
 log()  { local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
          echo -e "$msg"
-         $LOG_ENABLED && echo "$msg" >> "$LOG_FILE" || true; }
+         $LOG_ENABLED && echo "$msg" | sed 's/\x1b\[[0-9;]*[mK]//g' >> "$LOG_FILE" || true; }
 
 info()  { log "${CYAN}ℹ${RESET}  $*"; }
 ok()    { log "${GREEN}✔${RESET}  $*"; }
@@ -49,7 +49,9 @@ header(){ echo -e "\n${BOLD}$*${RESET}"; }
 # ── argument parsing ─────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --days)    MIN_AGE_DAYS="$2"; shift 2 ;;
+    --days)
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || { fail "--days must be a positive integer (got: $2)"; exit 1; }
+      MIN_AGE_DAYS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true;       shift   ;;
     --casks)   INCLUDE_CASKS=true; shift   ;;
     --log)     LOG_ENABLED=true;   shift   ;;
@@ -60,7 +62,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-MIN_AGE_SECONDS=$(( MIN_AGE_DAYS * 86400 ))
 NOW=$(date +%s)
 
 # ── dependency check ─────────────────────────────────────────
@@ -85,39 +86,112 @@ $LOG_ENABLED  && info "Logging to          : $LOG_FILE"                  || true
 
 # ── fetch version age from GitHub commit history ─────────────
 # The Homebrew JSON API has no version timestamp field; the source
-# of truth is the last commit touching the formula/cask Ruby file.
+# of truth is the oldest commit (among the last 10) that introduced
+# the current version string into the formula/cask Ruby file.
 # Both APIs expose ruby_source_path which maps to the GitHub path.
 # Returns empty string if age cannot be determined.
 _github_commit_age_days() {
-  local repo="$1" path="$2"
-  local commit_date
-  commit_date=$(curl -sf --max-time 10 "${GITHUB_HEADERS[@]}" \
-    "${GITHUB_API}/repos/${repo}/commits?path=${path}&per_page=1" \
-    | jq -r '.[0].commit.committer.date // empty' 2>/dev/null) || true
-  [[ -z "$commit_date" ]] && echo "" && return
+  local repo="$1" path="$2" version="$3"
+  # Fetch last 10 commits touching this file (newest-first)
+  local commits_json
+  commits_json=$(curl -sf --max-time 10 "${GITHUB_HEADERS[@]}" \
+    "${GITHUB_API}/repos/${repo}/commits?path=${path}&per_page=10" \
+    2>/dev/null) || true
+  [[ -z "$commits_json" ]] && echo "" && return
+
+  local num_commits
+  num_commits=$(echo "$commits_json" | jq 'length' 2>/dev/null) || true
+  [[ -z "$num_commits" || "$num_commits" -eq 0 ]] && echo "" && return
+
+  # Walk commits from newest to oldest, find the oldest one whose diff
+  # contains the version string — that is the version publication date.
+  local found_date="" i sha commit_date patch_has_version
+  for (( i=0; i<num_commits; i++ )); do
+    sha=$(echo "$commits_json" | jq -r ".[${i}].sha // empty" 2>/dev/null) || true
+    [[ -z "$sha" ]] && continue
+    commit_date=$(echo "$commits_json" | jq -r ".[${i}].commit.committer.date // empty" 2>/dev/null) || true
+    [[ -z "$commit_date" ]] && continue
+
+    # Fetch the diff for this commit and check if the version string appears
+    # in the patch for our specific file
+    patch_has_version=$(curl -sf --max-time 10 "${GITHUB_HEADERS[@]}" \
+      "${GITHUB_API}/repos/${repo}/commits/${sha}" \
+      | jq -r --arg path "$path" --arg ver "$version" \
+        '.files[] | select(.filename == $path) | .patch // "" | contains($ver)' \
+      2>/dev/null) || true
+
+    if [[ "$patch_has_version" == "true" ]]; then
+      # This commit contains the version string — keep walking to find older ones
+      found_date="$commit_date"
+    fi
+  done
+
+  # If version was never found in any diff, fall back to the oldest commit in the list
+  if [[ -z "$found_date" ]]; then
+    found_date=$(echo "$commits_json" | jq -r ".[-1].commit.committer.date // empty" 2>/dev/null) || true
+  fi
+
+  [[ -z "$found_date" ]] && echo "" && return
+
   local epoch
-  epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$commit_date" +%s 2>/dev/null \
-       || date -d "$commit_date" +%s 2>/dev/null) || true
+  epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$found_date" +%s 2>/dev/null \
+       || date -d "$found_date" +%s 2>/dev/null) || true
   [[ -z "$epoch" ]] && echo "" && return
   echo $(( (NOW - epoch) / 86400 ))
 }
 
 get_formula_age_days() {
   local name="$1"
-  local path
-  path=$(curl -sf --max-time 8 "${FORMULA_API}/${name}.json" \
-    | jq -r '.ruby_source_path // empty' 2>/dev/null) || true
+  # Check HTTP status to detect third-party taps (404 = not in homebrew-core)
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
+    "${FORMULA_API}/${name}.json") || true
+  if [[ "$http_code" == "404" ]]; then
+    echo "THIRD_PARTY"
+    return
+  fi
+  local api_json path version
+  api_json=$(curl -sf --max-time 8 "${FORMULA_API}/${name}.json" \
+    2>/dev/null) || true
+  [[ -z "$api_json" ]] && echo "" && return
+  path=$(echo "$api_json" | jq -r '.ruby_source_path // empty' 2>/dev/null) || true
   [[ -z "$path" ]] && echo "" && return
-  _github_commit_age_days "Homebrew/homebrew-core" "$path"
+  version=$(echo "$api_json" | jq -r '.versions.stable // empty' 2>/dev/null) || true
+  _github_commit_age_days "Homebrew/homebrew-core" "$path" "$version"
 }
 
 get_cask_age_days() {
   local name="$1"
-  local path
-  path=$(curl -sf --max-time 8 "${CASK_API}/${name}.json" \
-    | jq -r '.ruby_source_path // empty' 2>/dev/null) || true
+  # Check HTTP status to detect third-party taps (404 = not in homebrew-cask)
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
+    "${CASK_API}/${name}.json") || true
+  if [[ "$http_code" == "404" ]]; then
+    echo "THIRD_PARTY"
+    return
+  fi
+  local api_json path version
+  api_json=$(curl -sf --max-time 8 "${CASK_API}/${name}.json" \
+    2>/dev/null) || true
+  [[ -z "$api_json" ]] && echo "" && return
+  path=$(echo "$api_json" | jq -r '.ruby_source_path // empty' 2>/dev/null) || true
   [[ -z "$path" ]] && echo "" && return
-  _github_commit_age_days "Homebrew/homebrew-cask" "$path"
+  version=$(echo "$api_json" | jq -r '.version // empty' 2>/dev/null) || true
+  _github_commit_age_days "Homebrew/homebrew-cask" "$path" "$version"
+}
+
+# ── GitHub rate limit pre-flight check ───────────────────────
+check_github_rate_limit() {
+  local remaining
+  remaining=$(curl -sf --max-time 8 "${GITHUB_HEADERS[@]}" \
+    "${GITHUB_API}/rate_limit" \
+    | jq -r '.resources.core.remaining // empty' 2>/dev/null) || true
+  [[ -z "$remaining" ]] && return  # can't check, proceed
+  local needed=$(( ${#OUTDATED_FORMULAE[@]} * 3 ))  # ~3 calls per formula now
+  if (( remaining < needed )); then
+    warn "GitHub API: only ${remaining} requests remaining (need ~${needed}). Set GITHUB_TOKEN to avoid silent skips."
+    warn "Rate limit resets in: $(curl -sf --max-time 8 "${GITHUB_HEADERS[@]}" "${GITHUB_API}/rate_limit" | jq -r '(.resources.core.reset - now) | round | tostring + "s"' 2>/dev/null || echo 'unknown')"
+  fi
 }
 
 # ── process a list of packages ───────────────────────────────
@@ -138,8 +212,14 @@ process_packages() {
       age_days=$(get_cask_age_days "$pkg")
     fi
 
+    if [[ "$age_days" == "THIRD_PARTY" ]]; then
+      warn "$pkg — third-party tap, not in homebrew-core. Skipping. Run 'brew upgrade $pkg' manually after review."
+      (( unknown++ )) || true
+      continue
+    fi
+
     if [[ -z "$age_days" ]]; then
-      warn "$pkg — could not determine version age via API, SKIPPING (safety first)"
+      warn "$pkg — could not determine version age, skipping (safety first)"
       (( unknown++ )) || true
       continue
     fi
@@ -176,6 +256,7 @@ if [[ ${#OUTDATED_FORMULAE[@]} -eq 0 ]]; then
   info "No outdated formulae."
 else
   info "Found ${#OUTDATED_FORMULAE[@]} outdated formula(e): ${OUTDATED_FORMULAE[*]}"
+  check_github_rate_limit
   process_packages "formula" "${OUTDATED_FORMULAE[@]}"
 fi
 

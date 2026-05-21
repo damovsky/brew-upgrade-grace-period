@@ -119,7 +119,14 @@ echo "║   supply-chain-aware Homebrew upgrader       ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${RESET}"
 info "Minimum version age : ${BOLD}${MIN_AGE_DAYS} days${RESET}"
-$DRY_RUN      && info "Preview mode — run with --upgrade to apply" || true
+if $DRY_RUN; then
+  echo -e "${YELLOW}${BOLD}"
+  echo "  ╔══════════════════════════════════════════════╗"
+  echo "  ║   PREVIEW MODE — nothing will be changed     ║"
+  echo "  ║   Run with --upgrade to apply upgrades       ║"
+  echo "  ╚══════════════════════════════════════════════╝"
+  echo -e "${RESET}"
+fi
 $INCLUDE_CASKS && info "Cask upgrades       : enabled"             || true
 $LOG_ENABLED  && info "Logging to          : $LOG_FILE"            || true
 

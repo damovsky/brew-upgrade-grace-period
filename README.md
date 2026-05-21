@@ -15,6 +15,11 @@ This script adds a configurable delay: it checks when the current version was fi
 ## Install
 
 ```bash
+# Apple Silicon (M1/M2/M3) — Homebrew on /opt/homebrew
+curl -fsSL https://raw.githubusercontent.com/damovsky/brew-upgrade-grace-period/main/brew-safe-upgrade \
+  -o /opt/homebrew/bin/brew-safe-upgrade && chmod +x /opt/homebrew/bin/brew-safe-upgrade
+
+# Intel Mac — Homebrew on /usr/local
 curl -fsSL https://raw.githubusercontent.com/damovsky/brew-upgrade-grace-period/main/brew-safe-upgrade \
   -o /usr/local/bin/brew-safe-upgrade && chmod +x /usr/local/bin/brew-safe-upgrade
 ```

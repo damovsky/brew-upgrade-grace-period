@@ -7,21 +7,25 @@
 #  community time to detect and report malicious releases.
 #
 #  Usage:
-#    ./brew-safe-upgrade.sh              # default: 5-day gate
+#    ./brew-safe-upgrade.sh              # default: preview only (dry-run)
+#    ./brew-safe-upgrade.sh --upgrade    # actually apply upgrades
 #    ./brew-safe-upgrade.sh --days 7     # custom age gate
-#    ./brew-safe-upgrade.sh --dry-run    # preview only
 #    ./brew-safe-upgrade.sh --casks      # include casks
 #    ./brew-safe-upgrade.sh --log        # append to ~/brew-safe-upgrade.log
+#    ./brew-safe-upgrade.sh --version    # print version
 # ============================================================
+
+VERSION="1.0.0"
 
 set -euo pipefail
 
 # ── defaults ────────────────────────────────────────────────
 MIN_AGE_DAYS=5
-DRY_RUN=false
+DRY_RUN=true
 INCLUDE_CASKS=false
 LOG_ENABLED=false
 LOG_FILE="$HOME/brew-safe-upgrade.log"
+GLOBAL_FAILED=0
 
 FORMULA_API="https://formulae.brew.sh/api/formula"
 CASK_API="https://formulae.brew.sh/api/cask"
@@ -46,18 +50,52 @@ skip()  { log "${YELLOW}⏳${RESET} $*"; }
 fail()  { log "${RED}✘${RESET}  $*"; }
 header(){ echo -e "\n${BOLD}$*${RESET}"; }
 
+# ── help ─────────────────────────────────────────────────────
+show_help() {
+  cat <<'EOF'
+brew-safe-upgrade — supply-chain-aware Homebrew upgrader
+
+USAGE
+  brew-safe-upgrade [OPTIONS]
+
+OPTIONS
+  --upgrade     Actually upgrade eligible packages (default is preview only)
+  --dry-run     Preview what would be upgraded (default)
+  --days N      Grace period in days, N ≥ 1 (default: 5)
+  --casks       Include casks in addition to formulae
+  --log         Append clean log to ~/brew-safe-upgrade.log
+  --version     Print version and exit
+  -h, --help    Show this help
+
+ENVIRONMENT
+  GITHUB_TOKEN  GitHub personal access token (strongly recommended).
+                Without it you are limited to ~5 formulae per run.
+                A token with no scopes (public read-only) is sufficient.
+
+EXAMPLES
+  brew-safe-upgrade                        Preview eligible upgrades (safe)
+  brew-safe-upgrade --upgrade              Apply upgrades with 5-day gate
+  brew-safe-upgrade --upgrade --days 7     Stricter 7-day gate
+  brew-safe-upgrade --upgrade --casks      Include casks
+
+  # Daily cron (9am):
+  GITHUB_TOKEN=ghp_... brew-safe-upgrade --upgrade --casks --log
+EOF
+}
+
 # ── argument parsing ─────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --upgrade) DRY_RUN=false; shift ;;
+    --dry-run) DRY_RUN=true;  shift ;;
     --days)
+      [[ $# -lt 2 ]] && { fail "--days requires an argument"; exit 1; }
       [[ "$2" =~ ^[1-9][0-9]*$ ]] || { fail "--days must be a positive integer (got: $2)"; exit 1; }
       MIN_AGE_DAYS="$2"; shift 2 ;;
-    --dry-run) DRY_RUN=true;       shift   ;;
     --casks)   INCLUDE_CASKS=true; shift   ;;
     --log)     LOG_ENABLED=true;   shift   ;;
-    -h|--help)
-      sed -n '3,12p' "$0" | sed 's/#  *//'
-      exit 0 ;;
+    -h|--help) show_help; exit 0 ;;
+    --version) echo "brew-safe-upgrade $VERSION"; exit 0 ;;
     *) fail "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -68,6 +106,7 @@ NOW=$(date +%s)
 for dep in brew curl jq; do
   if ! command -v "$dep" &>/dev/null; then
     fail "Required tool not found: $dep"
+    [[ "$dep" == "jq" ]] && fail "  → Install with: brew install jq"
     exit 1
   fi
 done
@@ -80,9 +119,9 @@ echo "║   supply-chain-aware Homebrew upgrader       ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${RESET}"
 info "Minimum version age : ${BOLD}${MIN_AGE_DAYS} days${RESET}"
-$DRY_RUN      && warn "Dry-run mode — nothing will actually be upgraded" || true
-$INCLUDE_CASKS && info "Cask upgrades       : enabled"                   || true
-$LOG_ENABLED  && info "Logging to          : $LOG_FILE"                  || true
+$DRY_RUN      && info "Preview mode — run with --upgrade to apply" || true
+$INCLUDE_CASKS && info "Cask upgrades       : enabled"             || true
+$LOG_ENABLED  && info "Logging to          : $LOG_FILE"            || true
 
 # ── fetch version age from GitHub commit history ─────────────
 # The Homebrew JSON API has no version timestamp field; the source
@@ -187,7 +226,8 @@ check_github_rate_limit() {
     "${GITHUB_API}/rate_limit" \
     | jq -r '.resources.core.remaining // empty' 2>/dev/null) || true
   [[ -z "$remaining" ]] && return  # can't check, proceed
-  local needed=$(( ${#OUTDATED_FORMULAE[@]} * 3 ))  # ~3 calls per formula now
+  local needed
+  needed=$(( ${#OUTDATED_FORMULAE[@]} * 3 ))  # ~3 calls per formula now
   if (( remaining < needed )); then
     warn "GitHub API: only ${remaining} requests remaining (need ~${needed}). Set GITHUB_TOKEN to avoid silent skips."
     warn "Rate limit resets in: $(curl -sf --max-time 8 "${GITHUB_HEADERS[@]}" "${GITHUB_API}/rate_limit" | jq -r '(.resources.core.reset - now) | round | tostring + "s"' 2>/dev/null || echo 'unknown')"
@@ -204,7 +244,13 @@ process_packages() {
   local type_flag=""
   [[ "$type" == "cask" ]] && type_flag="--cask"
 
+  local total=${#packages[@]}
+  local idx=0
+
   for pkg in "${packages[@]}"; do
+    (( idx++ )) || true
+    local prefix="[${idx}/${total}]"
+
     local age_days=""
     if [[ "$type" == "formula" ]]; then
       age_days=$(get_formula_age_days "$pkg")
@@ -213,37 +259,47 @@ process_packages() {
     fi
 
     if [[ "$age_days" == "THIRD_PARTY" ]]; then
-      warn "$pkg — third-party tap, not in homebrew-core. Skipping. Run 'brew upgrade $pkg' manually after review."
+      warn "$prefix $pkg — third-party tap, not in homebrew-core. Skipping. Run 'brew upgrade $pkg' manually after review."
       (( unknown++ )) || true
       continue
     fi
 
     if [[ -z "$age_days" ]]; then
-      warn "$pkg — could not determine version age, skipping (safety first)"
+      warn "$prefix $pkg — could not determine version age, skipping (safety first)"
       (( unknown++ )) || true
       continue
     fi
 
     if (( age_days >= MIN_AGE_DAYS )); then
-      ok "$pkg — ${age_days}d old → eligible for upgrade"
+      ok "$prefix $pkg — ${age_days}d old → eligible for upgrade"
       if $DRY_RUN; then
         info "  [dry-run] would run: brew upgrade${type_flag:+ $type_flag} $pkg"
       else
-        if brew upgrade ${type_flag:+$type_flag} "$pkg" 2>&1; then
-          (( upgraded++ )) || true
+        if [[ -n "$type_flag" ]]; then
+          if brew upgrade "$type_flag" "$pkg" 2>&1; then
+            (( upgraded++ )) || true
+          else
+            fail "$prefix $pkg — upgrade failed"
+            (( failed++ )) || true
+          fi
         else
-          fail "$pkg — upgrade failed"
-          (( failed++ )) || true
+          if brew upgrade "$pkg" 2>&1; then
+            (( upgraded++ )) || true
+          else
+            fail "$prefix $pkg — upgrade failed"
+            (( failed++ )) || true
+          fi
         fi
       fi
     else
-      skip "$pkg — only ${age_days}d old (need ${MIN_AGE_DAYS}d) → skipping"
+      skip "$prefix $pkg — only ${age_days}d old (need ${MIN_AGE_DAYS}d) → skipping"
       (( skipped++ )) || true
     fi
   done
 
   echo ""
   info "Summary ($type): upgraded=${upgraded}  skipped=${skipped}  age-unknown=${unknown}  failed=${failed}"
+  GLOBAL_FAILED=$(( GLOBAL_FAILED + failed ))
 }
 
 # ── formulae ─────────────────────────────────────────────────
@@ -277,3 +333,4 @@ fi
 
 header "── Done ──────────────────────────────────────────"
 info "Finished at $(date '+%Y-%m-%d %H:%M:%S')"
+[[ $GLOBAL_FAILED -gt 0 ]] && exit 1 || true

@@ -15,7 +15,7 @@ This script adds a configurable delay: it checks when the current version was fi
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/damovsky/brew-upgrade-grace-period/main/brew-safe-upgrade.sh \
+curl -fsSL https://raw.githubusercontent.com/damovsky/brew-upgrade-grace-period/main/brew-safe-upgrade \
   -o /usr/local/bin/brew-safe-upgrade && chmod +x /usr/local/bin/brew-safe-upgrade
 ```
 

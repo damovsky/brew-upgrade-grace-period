@@ -193,6 +193,24 @@ Before upgrading a third-party formula manually, check the tap's release notes a
 
 ---
 
+## Updating
+
+Re-run the same install command you used originally. It overwrites the existing binary in place:
+
+```bash
+# Apple Silicon
+curl -fsSL https://raw.githubusercontent.com/damovsky/brew-upgrade-grace-period/main/brew-safe-upgrade \
+  -o /opt/homebrew/bin/brew-safe-upgrade && chmod +x /opt/homebrew/bin/brew-safe-upgrade
+
+# Intel
+curl -fsSL https://raw.githubusercontent.com/damovsky/brew-upgrade-grace-period/main/brew-safe-upgrade \
+  -o /usr/local/bin/brew-safe-upgrade && chmod +x /usr/local/bin/brew-safe-upgrade
+```
+
+Check your current version first with `brew-safe-upgrade --version`, and check the latest version in the [releases](https://github.com/damovsky/brew-upgrade-grace-period/releases) or the `VERSION` variable at the top of the script.
+
+---
+
 ## Contributing
 
 Bug reports and PRs are welcome. Before submitting:

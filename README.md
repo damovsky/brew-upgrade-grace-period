@@ -23,6 +23,15 @@ brew install brew-safe-upgrade
 
 `jq` is installed automatically as a dependency.
 
+First tap on fresh machine may hit:
+
+```
+Error: Refusing to load formula damovsky/tap/brew-safe-upgrade from untrusted tap damovsky/tap.
+Run `brew trust --formula damovsky/tap/brew-safe-upgrade` or `brew trust damovsky/tap` to trust it.
+```
+
+Fix: `brew trust damovsky/tap`, then retry install.
+
 **Manual install (Apple Silicon):**
 
 ```bash
